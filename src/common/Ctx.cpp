@@ -69,11 +69,14 @@ namespace OpenLogReplicator {
             bigEndian(false),
             memoryMinMb(0),
             memoryMaxMb(0),
+            memoryReserveMb(0),
+            memorySwapMb(0),
             memoryChunks(nullptr),
             memoryChunksMin(0),
             memoryChunksAllocated(0),
             memoryChunksFree(0),
             memoryChunksMax(0),
+            memoryChunksMaxReserve(0),
             memoryChunksHWM(0),
             memoryChunksReusable(0),
             mainThread(pthread_self()),
@@ -84,6 +87,7 @@ namespace OpenLogReplicator {
             columnLimit(COLUMN_LIMIT),
             dumpRedoLog(0),
             dumpRawData(0),
+            dumpStream(std::make_unique<std::ofstream>()),
             readBufferMax(0),
             buffersFree(0),
             bufferSizeMax(0),
@@ -111,12 +115,13 @@ namespace OpenLogReplicator {
             disableChecks(0),
             hardShutdown(false),
             softShutdown(false),
-            replicatorFinished(false) {
+            replicatorFinished(false),
+            swappedFlushXid(0, 0, 0),
+            swappedShrinkXid(0, 0, 0) {
         memoryModulesAllocated[0] = 0;
         memoryModulesAllocated[1] = 0;
         memoryModulesAllocated[2] = 0;
         memoryModulesAllocated[3] = 0;
-        dumpStream = std::make_unique<std::ofstream>();
 
         clock = new ClockHW();
         tzset();
@@ -650,11 +655,14 @@ namespace OpenLogReplicator {
         };
     }
 
-    void Ctx::initialize(uint64_t newMemoryMinMb, uint64_t newMemoryMaxMb, uint64_t newReadBufferMax) {
+    void Ctx::initialize(uint64_t newMemoryMinMb, uint64_t newMemoryMaxMb, uint64_t newMemoryReserveMb, uint64_t newMemorySwapMb, uint64_t newReadBufferMax) {
         memoryMinMb = newMemoryMinMb;
         memoryMaxMb = newMemoryMaxMb;
+        memoryReserveMb = newMemoryReserveMb;
+        memorySwapMb = newMemorySwapMb;
         memoryChunksMin = (memoryMinMb / MEMORY_CHUNK_SIZE_MB);
         memoryChunksMax = memoryMaxMb / MEMORY_CHUNK_SIZE_MB;
+        memoryChunksMaxReserve = (memoryMaxMb - memoryReserveMb) / MEMORY_CHUNK_SIZE_MB;
         readBufferMax = newReadBufferMax;
         buffersFree = newReadBufferMax;
         bufferSizeMax = readBufferMax * MEMORY_CHUNK_SIZE;
@@ -693,11 +701,12 @@ namespace OpenLogReplicator {
         return memoryChunksAllocated * MEMORY_CHUNK_SIZE_MB;
     }
 
-    uint8_t* Ctx::getMemoryChunk(uint64_t module, bool reusable) {
+    uint8_t* Ctx::getMemoryChunk(uint64_t module, bool reusable, bool reserve) {
         std::unique_lock<std::mutex> lck(memoryMtx);
+        uint64_t memoryMax = reserve ? memoryChunksMax : memoryChunksMaxReserve;
 
         if (memoryChunksFree == 0) {
-            while (memoryChunksAllocated == memoryChunksMax && !softShutdown) {
+            while (memoryChunksAllocated >= memoryMax && !softShutdown) {
                 if (likely(memoryChunksReusable > 1)) {
                     warning(10067, "out of memory, but there are reusable memory chunks, trying to reuse some memory");
 
@@ -799,6 +808,151 @@ namespace OpenLogReplicator {
                 case MEMORY_MODULE_TRANSACTIONS:
                     metrics->emitMemoryUsedMbTransactions(memoryModulesAllocated[module]);
             }
+        }
+    }
+
+    void Ctx::swappedMemoryInit(typeXid xid) {
+        SwapChunk* sc = new SwapChunk();
+        std::unique_lock<std::mutex> lck(swapMtx);
+        swapChunks[xid] = sc;
+    }
+
+    uint64_t Ctx::swappedMemorySize(typeXid xid) const {
+        std::unique_lock<std::mutex> lck(swapMtx);
+        auto it = swapChunks.find(xid);
+        if (it == swapChunks.end())
+            return 0;
+        SwapChunk* sc = it->second;
+        return sc->chunks.size();
+    }
+
+    uint8_t* Ctx::swappedMemoryLast(typeXid xid) const {
+        std::unique_lock<std::mutex> lck(swapMtx);
+        auto it = swapChunks.find(xid);
+        if (it == swapChunks.end())
+            return 0;
+        SwapChunk* sc = it->second;
+        return sc->chunks.back();
+    }
+
+    uint8_t* Ctx::swappedMemoryGet(typeXid xid, int64_t index) {
+        std::unique_lock<std::mutex> lck(swapMtx);
+        auto it = swapChunks.find(xid);
+        if (it == swapChunks.end())
+            return 0;
+        SwapChunk* sc = it->second;
+
+        while (!hardShutdown) {
+            if (index < sc->swappedMin || index > sc->swappedMax)
+                return sc->chunks.at(index);
+
+            chunksMemoryManager.notify_all();
+            chunksTransaction.wait(lck);
+        }
+
+        return nullptr;
+    }
+
+    void Ctx::swappedMemoryRelease(typeXid xid, int64_t index) {
+        uint8_t* tc;
+        {
+            std::unique_lock<std::mutex> lck(swapMtx);
+            auto it = swapChunks.find(xid);
+            if (it == swapChunks.end())
+                return;
+            SwapChunk* sc = it->second;
+            tc = sc->chunks.at(index);
+            sc->chunks[index] = nullptr;
+        }
+
+        freeMemoryChunk(Ctx::MEMORY_MODULE_TRANSACTIONS, tc, false);
+    }
+
+    void Ctx::swappedMemoryGrow(typeXid xid) {
+        bool reusable;
+        SwapChunk* sc;
+        {
+            std::unique_lock<std::mutex> lck(swapMtx);
+            auto it = swapChunks.find(xid);
+            if (it == swapChunks.end())
+                return;
+            sc = it->second;
+            reusable = sc->chunks.size() > 0 ? false : true;
+        }
+
+        uint8_t* tc = getMemoryChunk(Ctx::MEMORY_MODULE_TRANSACTIONS, reusable, false);
+        memset(tc, 0, sizeof(uint64_t) + sizeof(uint32_t));
+
+        {
+            std::unique_lock<std::mutex> lck(swapMtx);
+            sc->chunks.push_back(tc);
+        }
+    }
+
+    void Ctx::swappedMemoryShrink(typeXid xid) {
+        SwapChunk* sc;
+        uint8_t* tc;
+        bool reusable;
+        {
+            std::unique_lock<std::mutex> lck(swapMtx);
+            auto it = swapChunks.find(xid);
+            if (it == swapChunks.end())
+                return;
+            sc = it->second;
+            tc = sc->chunks.back();
+            reusable = sc->chunks.size() == 1 ? true : false;
+        }
+
+        freeMemoryChunk(Ctx::MEMORY_MODULE_TRANSACTIONS, tc, reusable);
+
+        {
+            std::unique_lock<std::mutex> lck(swapMtx);
+            sc->chunks.pop_back();
+            if (sc->chunks.size() <= 0)
+                return;
+            int64_t index = sc->chunks.size() - 1;
+
+            swappedShrinkXid = xid;
+            while (!hardShutdown) {
+                if (index < sc->swappedMin || index > sc->swappedMax)
+                    break;
+
+                chunksMemoryManager.notify_all();
+                chunksTransaction.wait(lck);
+            }
+            swappedShrinkXid = 0;
+        }
+    }
+
+    void Ctx::swappedMemoryFlush(typeXid xid) {
+        std::unique_lock<std::mutex> lck(swapMtx);
+        swappedFlushXid = xid;
+    }
+
+    void Ctx::swappedMemoryRemove(typeXid xid) {
+        SwapChunk* sc;
+        {
+            std::unique_lock<std::mutex> lck(swapMtx);
+            auto it = swapChunks.find(xid);
+            if (it == swapChunks.end())
+                return;
+            sc = it->second;
+            sc->release = true;
+            swappedFlushXid = 0;
+        }
+
+        bool first = true;
+        for (auto tc: sc->chunks) {
+            if (tc != nullptr)
+                freeMemoryChunk(Ctx::MEMORY_MODULE_TRANSACTIONS, tc, first);
+            first = false;
+        }
+
+        {
+            std::unique_lock<std::mutex> lck(swapMtx);
+            sc->chunks.clear();
+            commitedXids.push_back(xid);
+            chunksMemoryManager.notify_all();
         }
     }
 
